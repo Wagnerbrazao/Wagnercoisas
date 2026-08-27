@@ -16,12 +16,15 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from dotenv import load_dotenv  # noqa: E402
+
 import iniciar_chrome  # noqa: E402
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 PORTA = iniciar_chrome.PORTA
 CDP_URL = "http://127.0.0.1:%d" % PORTA
 AQUI = os.path.dirname(os.path.abspath(__file__))
-
 
 def cdp_ativo():
     try:
@@ -55,7 +58,8 @@ def main():
     print("      Resolvendo hCaptcha via Gemini vision...\n")
     env = os.environ.copy()
     if "GEMINI_API_KEY" not in env:
-        print("[-] Defina GEMINI_API_KEY: export GEMINI_API_KEY=...")
+        print("[-] GEMINI_API_KEY não encontrada. Coloque no .env ao lado\n"
+              "    deste script:  GEMINI_API_KEY=sua_chave")
         return
     r = subprocess.run(
         [sys.executable, os.path.join(AQUI, "shot_groq.py")],

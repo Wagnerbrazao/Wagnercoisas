@@ -13,13 +13,18 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import google.generativeai as genai
+from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
+
+# carrega o .env que fica ao lado deste arquivo (funciona de qualquer cwd)
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 CPF = os.environ.get("CPF", "")
 DATA_NASCIMENTO = os.environ.get("DATA_NASCIMENTO", "")
 URL = "https://servicos.receita.fazenda.gov.br/Servicos/CPF/ConsultaSituacao/ConsultaPublica.asp"
 CDP_URL = "http://127.0.0.1:9222"
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 HUMANISE = None
 try:
@@ -56,7 +61,7 @@ def main():
 
     genai.configure(api_key=GEMINI_KEY)
     model = genai.GenerativeModel(
-        "gemini-3.5-flash-lite",
+        GEMINI_MODEL,
         # temperatura 0 = resposta determinística; poucos tokens = resposta mais rápida
         generation_config={"temperature": 0, "max_output_tokens": 30},
     )
