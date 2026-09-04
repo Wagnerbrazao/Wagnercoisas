@@ -5,3 +5,4 @@ __pycache__/
 *.bak
 chrome_profile_enzo/
 *.png
+.claude/settings.local.json
