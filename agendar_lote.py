@@ -20,6 +20,8 @@ import sys
 import time
 import urllib.request
 
+from janela_chrome import flags_janela
+
 AQUI = os.path.dirname(os.path.abspath(__file__))
 CDP_URL = "http://127.0.0.1:9222"
 CHROME = "/opt/google/chrome/google-chrome"
@@ -51,8 +53,8 @@ def garantir_chrome():
     aviso("Chrome sem CDP; subindo de novo.")
     subprocess.Popen(
         [CHROME, "--remote-debugging-port=9222", "--remote-allow-origins=*",
-         "--user-data-dir=%s" % PERFIL, "--profile-directory=Default",
-         "--start-maximized", "--lang=pt-BR", "--no-first-run", URL],
+         "--user-data-dir=%s" % PERFIL, "--profile-directory=Default"]
+        + flags_janela() + ["--lang=pt-BR", "--no-first-run", URL],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     for _ in range(60):
         if cdp_ativo():

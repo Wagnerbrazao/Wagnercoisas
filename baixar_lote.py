@@ -14,6 +14,7 @@ Retoma de onde parou: CPF que ja tem PDF na pasta de saida e pulado.
 
 import argparse
 import base64
+import collections
 import csv
 import os
 import random
@@ -180,7 +181,7 @@ class Rotador(object):
         return None
 
 
-def resolver_captcha(page, model, tentativas=8):
+def resolver_captcha(page, model, tentativas=8, prazo=None):
     """Clica no hCaptcha e resolve o desafio com o Gemini. True se passou."""
     caixa = page.locator(".h-captcha iframe").bounding_box()
     if caixa:
@@ -192,6 +193,9 @@ def resolver_captcha(page, model, tentativas=8):
     time.sleep(2)
 
     for tentativa in range(tentativas):
+        if prazo and time.time() > prazo:
+            print("    [!] Tempo maximo estourado; abandonando este CPF.")
+            return False
         if "ConsultaPublicaExibir" in page.url:
             return True
 
@@ -291,7 +295,22 @@ def mensagem_erro(page):
     return ""
 
 
-def consultar(page, cdp, model, registro, saida, tentativas=8):
+def ja_baixado(saida, cpf):
+    """True se ja existe comprovante desse CPF, com o nome antigo ou o novo."""
+    try:
+        return any(n.startswith(cpf) and n.endswith(".pdf") for n in os.listdir(saida))
+    except FileNotFoundError:
+        return False
+
+
+def nome_com_situacao(saida, cpf, corpo):
+    """Caminho "CPF - SITUACAO CADASTRAL.pdf" lido da pagina do comprovante."""
+    m = re.search(r"Situa\S+o Cadastral:\s*(.+)", corpo or "")
+    sit = re.sub(r"[^A-Za-z\u00c0-\u00ff ]+", "", m.group(1)).strip() if m else ""
+    return os.path.join(saida, ("%s - %s.pdf" % (cpf, sit)) if sit else ("%s.pdf" % cpf))
+
+
+def consultar(page, cdp, model, registro, saida, tentativas=8, tempo_max=0):
     cpf, data = registro["cpf"], registro["data"]
     destino = os.path.join(saida, "%s.pdf" % cpf)
 
@@ -310,7 +329,8 @@ def consultar(page, cdp, model, registro, saida, tentativas=8):
     page.evaluate("() => document.getElementById('txtDataNascimento').blur()")
     time.sleep(0.3)
 
-    resolver_captcha(page, model, tentativas)
+    prazo = (time.time() + tempo_max) if tempo_max else None
+    resolver_captcha(page, model, tentativas, prazo)
 
     if "ConsultaPublicaExibir" not in page.url:
         token = page.evaluate(
@@ -341,6 +361,20 @@ def consultar(page, cdp, model, registro, saida, tentativas=8):
         time.sleep(2.5)
 
     if "ConsultaPublicaExibir" in page.url:
+        # a pagina de erro tambem cai nessa URL: sem o campo "Cadastral:" nao e
+        # comprovante, e salvar isso como PDF passa erro por sucesso
+        try:
+            corpo = page.inner_text("body")
+        except Exception:
+            corpo = ""
+        if "Cadastral:" not in corpo:
+            aviso = ""
+            for linha in corpo.splitlines():
+                if "divergente" in linha.lower() or "nao existe" in linha.lower():
+                    aviso = linha.strip()[:160]
+                    break
+            return "dados_invalidos", aviso or "pagina sem os campos do comprovante"
+        destino = nome_com_situacao(saida, cpf, corpo)
         salvar_pdf(cdp, destino)
         return "ok", destino
 
@@ -358,6 +392,10 @@ def main():
                     help="pausa media entre consultas, em segundos (padrao 12)")
     ap.add_argument("--limite", type=int, default=0, help="processa apenas os N primeiros")
     ap.add_argument("--refazer", action="store_true", help="reconsulta CPF que ja tem PDF")
+    ap.add_argument("--tempo-max", type=float, default=180, dest="tempo_max",
+                    help="segundos por CPF; ao estourar vai para o fim da fila (0 = sem limite)")
+    ap.add_argument("--repescagens", type=int, default=1,
+                    help="quantas vezes um CPF pode voltar para o fim da fila (padrao 1)")
     ap.add_argument("--tentativas", type=int, default=8,
                     help="tentativas de captcha por CPF (padrao 8)")
     args = ap.parse_args()
@@ -380,7 +418,7 @@ def main():
 
     os.makedirs(args.saida, exist_ok=True)
     if not args.refazer:
-        fila = [r for r in fila if not os.path.exists(os.path.join(args.saida, "%s.pdf" % r["cpf"]))]
+        fila = [r for r in fila if not ja_baixado(args.saida, r["cpf"])]
     if args.limite:
         fila = fila[:args.limite]
 
@@ -423,21 +461,49 @@ def main():
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
         cdp = ctx.new_cdp_session(page)
 
-        for i, registro in enumerate(fila, 1):
-            rotulo = registro["nome"] or registro["cpf"]
-            print("\n[%d/%d] %s (%s / %s)" % (i, len(fila), rotulo, registro["cpf"], registro["data"]))
+        pendentes = collections.deque(fila)
+        voltas = {}
+        seguidos_rede = 0
+        i, total = 0, len(fila)
+        while pendentes:
+            registro = pendentes.popleft()
+            cpf = registro["cpf"]
+            i += 1
+            marca = "" if not voltas.get(cpf) else " (repescagem %d)" % voltas[cpf]
+            print("\n[%d/%d]%s %s (%s / %s)" % (i, total, marca,
+                  registro["nome"] or cpf, cpf, registro["data"]))
+            comeco = time.time()
             try:
-                status, detalhe = consultar(page, cdp, model, registro, args.saida, args.tentativas)
+                status, detalhe = consultar(page, cdp, model, registro, args.saida,
+                                            args.tentativas, args.tempo_max)
             except SemModelos as e:
                 print("\n[-] %s" % e)
                 break
             except Exception as e:
                 status, detalhe = "erro", str(e)[:200]
             contagem[status] = contagem.get(status, 0) + 1
-            print("    -> %s %s" % (status, detalhe or ""))
-            escritor.writerow([registro["cpf"], registro["nome"], registro["data"], status, detalhe])
+            print("    -> %s (%.0fs) %s" % (status, time.time() - comeco, detalhe or ""))
+            texto_erro = (detalhe or "") if status == "erro" else ""
+            if "has been closed" in texto_erro:
+                escritor.writerow([cpf, registro["nome"], registro["data"], status, detalhe])
+                print("\n[-] Chrome fechou. Encerrando para o vigia subir de novo.")
+                break
+            seguidos_rede = (seguidos_rede + 1) if ("ERR_" in texto_erro or "Timeout" in texto_erro) else 0
+            if seguidos_rede >= 5:
+                escritor.writerow([cpf, registro["nome"], registro["data"], status, detalhe])
+                print("\n[-] 5 falhas de rede seguidas. Encerrando para reautenticar a rede.")
+                break
+            escritor.writerow([cpf, registro["nome"], registro["data"], status, detalhe])
             log.flush()
-            if i < len(fila):
+
+            # nao saiu e ainda tem repescagem: volta para o fim da fila
+            if status != "ok" and voltas.get(cpf, 0) < args.repescagens:
+                voltas[cpf] = voltas.get(cpf, 0) + 1
+                pendentes.append(registro)
+                total += 1
+                print("    [i] Volta para o fim da fila (%d na frente)." % (len(pendentes) - 1))
+
+            if pendentes:
                 pausa = max(3.0, random.uniform(args.intervalo * 0.7, args.intervalo * 1.3))
                 time.sleep(pausa)
 

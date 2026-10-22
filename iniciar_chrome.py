@@ -19,6 +19,8 @@ import sys
 import time
 import urllib.request
 
+from janela_chrome import flags_janela, janela_visivel
+
 CHROME = "/opt/google/chrome/google-chrome"
 PORTA = 9222
 PERFIL_REAL = os.path.expanduser("~/.config/google-chrome")
@@ -45,7 +47,15 @@ def atualizar_copia():
     origem = os.path.join(PERFIL_REAL, PERFIL_FONTE)
     destino = os.path.join(PERFIL_CDP, "Default")
     if not os.path.isdir(origem):
+        # servidor nao tem Chrome de verdade instalado com perfil de gente;
+        # se a copia ja estiver aqui (veio junto no deploy), ela serve
+        if os.path.isdir(destino):
+            print("[+] Sem Chrome real nesta máquina; usando a cópia que já existe "
+                  "em chrome_profile_enzo/")
+            return True
         print("[!] Perfil '%s' não existe em %s" % (PERFIL_FONTE, PERFIL_REAL))
+        print("    Em servidor: copie a pasta chrome_profile_enzo/ da máquina "
+              "onde o robô já roda.")
         return False
     print("[+] Copiando perfil '%s' -> chrome_profile_enzo/ (cookies atuais)..." %
           PERFIL_FONTE)
@@ -64,7 +74,7 @@ def main():
         print("    Rode: venv/bin/python Captcha/shot_playwright.py")
         return
 
-    if glob.glob(os.path.join(PERFIL_REAL, "SingletonLock")):
+    if os.path.isdir(PERFIL_REAL) and glob.glob(os.path.join(PERFIL_REAL, "SingletonLock")):
         print("[!] Seu Chrome está ABERTO no momento.")
         print("    Feche todas as janelas dele e rode este comando de novo.")
         print("    (A cópia do perfil só pode ser feita com o Chrome fechado)")
@@ -73,8 +83,8 @@ def main():
     if not atualizar_copia():
         return
 
-    print("[+] Abrindo Chrome (cópia do perfil '%s') com remote-debugging..." %
-          PERFIL_FONTE)
+    print("[+] Abrindo Chrome (cópia do perfil '%s') com remote-debugging%s..." %
+          (PERFIL_FONTE, "" if janela_visivel() else ", sem janela na tela"))
     subprocess.Popen(
         [
             CHROME,
@@ -82,7 +92,7 @@ def main():
             "--remote-allow-origins=*",
             "--user-data-dir=%s" % PERFIL_CDP,
             "--profile-directory=Default",
-            "--start-maximized",
+            *flags_janela(),
             "--lang=pt-BR",
             "--no-first-run",
             URL,
