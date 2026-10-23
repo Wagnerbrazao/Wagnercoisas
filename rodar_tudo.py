@@ -8,9 +8,11 @@ CPF sem data consulta o nascimento no Projudi. Sem argumentos, usa CPF ou CNPJ d
 """
 
 import argparse
+import collections
 import csv
 import json
 import os
+import random
 import re
 import signal
 import shutil
@@ -233,6 +235,54 @@ def garantir_chrome(prazo):
     raise RuntimeError("O Chrome da automação não iniciou na porta %d." % PORTA)
 
 
+SITES_AQUECIMENTO = (
+    "https://www.youtube.com/",
+    "https://www.google.com/",
+    "https://pt.wikipedia.org/wiki/Especial:Aleat%C3%B3ria",
+    "https://g1.globo.com/",
+    "https://www.uol.com.br/",
+    "https://www.climatempo.com.br/",
+    "https://www.bbc.com/portuguese",
+    "https://www.mercadolivre.com.br/",
+    "https://ge.globo.com/",
+)
+
+
+def passear(page, url, segundos):
+    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    fim = time.monotonic() + segundos
+    while time.monotonic() < fim:
+        sorteio = random.random()
+        if sorteio < 0.6:
+            page.mouse.wheel(0, random.randint(200, 700))
+        elif sorteio < 0.8:
+            page.mouse.wheel(0, -random.randint(100, 400))
+        else:
+            page.mouse.move(random.randint(100, 1500), random.randint(100, 800),
+                            steps=random.randint(5, 15))
+        time.sleep(random.uniform(1.5, 4.0))
+
+
+def aquecer_perfil(quantos=3, por_site=(25, 55)):
+    """O hCaptcha pontua o navegador pelo historico de uso: perfil que so abre
+    a pagina da Receita, resolve captcha e sai cobra desafio mais dificil."""
+    escolhidos = random.sample(SITES_AQUECIMENTO, min(quantos, len(SITES_AQUECIMENTO)))
+    with sync_playwright() as p:
+        navegador = p.chromium.connect_over_cdp(CDP_URL, timeout=30000)
+        page = navegador.contexts[0].new_page()
+        try:
+            for url in escolhidos:
+                segundos = random.uniform(*por_site)
+                sitio = url.split("/")[2]
+                print("[~] Aquecendo o perfil em %s (%ds)..." % (sitio, segundos), flush=True)
+                try:
+                    passear(page, url, segundos)
+                except Exception as erro:
+                    print("[!] %s nao respondeu: %s" % (sitio, mensagem_segura(erro)), flush=True)
+        finally:
+            page.close()
+
+
 def modelo_gemini():
     chave = os.environ.get("GEMINI_API_KEY", "").strip()
     if not chave:
@@ -253,7 +303,7 @@ def perguntar(modelo, imagem, prazo):
             )
             return sorted({int(n) for n in re.findall(r"\b[1-9]\b", resposta.text)})
         except Exception as erro:
-            if not any(codigo in str(erro) for codigo in ("429", "503")) or tentativa == 2:
+            if not any(codigo in str(erro) for codigo in ("429", "503", "504")) or tentativa == 2:
                 raise
             print("[!] Serviço de IA temporariamente indisponível; aguardando 10s.", flush=True)
             time.sleep(min(10, tempo_restante(prazo) / 1000))
@@ -525,6 +575,113 @@ def executar(documento, data=None, saida=None, tempo_max=180):
         return 1
 
 
+def ler_fila(caminho):
+    with open(caminho, newline="", encoding="utf-8-sig") as arquivo:
+        amostra = arquivo.read(4096)
+        arquivo.seek(0)
+        try:
+            dialeto = csv.Sniffer().sniff(amostra, delimiters=";,\t")
+        except csv.Error:
+            dialeto = csv.excel
+            dialeto.delimiter = ";"
+        leitor = csv.DictReader(arquivo, dialect=dialeto)
+        colunas = {(nome or "").strip().lower(): nome for nome in (leitor.fieldnames or [])}
+        col_doc = (colunas.get("cpf") or colunas.get("cnpj") or colunas.get("documento")
+                   or colunas.get("documento_credito"))
+        col_data = colunas.get("data_nascimento") or colunas.get("nascimento") or colunas.get("data")
+        col_nome = colunas.get("nome") or colunas.get("nome_credito")
+        if not col_doc:
+            raise ValueError("O CSV precisa de uma coluna 'cpf', 'cnpj' ou 'documento'.")
+        fila, vistos, ignorados = [], set(), 0
+        for linha in leitor:
+            documento = normalizar_documento(linha.get(col_doc, ""))
+            data = (linha.get(col_data) or "").strip() if col_data else ""
+            if not documento or documento in vistos:
+                continue
+            try:
+                identificar_consulta(documento, data or None)
+            except ValueError:
+                try:
+                    identificar_consulta(documento)  # CNPJ com data sobrando no CSV
+                except ValueError:
+                    ignorados += 1
+                    continue
+                data = ""
+            vistos.add(documento)
+            fila.append({"documento": documento, "data": data or None,
+                         "nome": (linha.get(col_nome) or "").strip() if col_nome else ""})
+        return fila, ignorados
+
+
+def ja_consultado(documento, saida=None):
+    if saida:
+        bases = [Path(saida).expanduser().resolve()]
+    else:
+        bases = [SAIDA_PADRAO / "cpf", SAIDA_PADRAO / "cnpj"]
+    return any(pdf.is_file() for base in bases
+               for pdf in base.glob(documento + "_*/comprovante.pdf"))
+
+
+def executar_lote(entrada, saida=None, tempo_max=180, repescagens=1, intervalo=10, aquecer=True):
+    try:
+        fila, ignorados = ler_fila(entrada)
+    except (OSError, ValueError) as erro:
+        print("[-] Nao deu para ler o CSV: %s" % mensagem_segura(erro), file=sys.stderr, flush=True)
+        return 1
+    if ignorados:
+        print("[!] %d linha(s) sem documento ou data valida foram ignoradas." % ignorados, flush=True)
+    pendentes = collections.deque(r for r in fila if not ja_consultado(r["documento"], saida))
+    prontos = len(fila) - len(pendentes)
+    print("[+] %d documento(s) no CSV | %d ja consultados | %d na fila"
+          % (len(fila), prontos, len(pendentes)), flush=True)
+    if not pendentes:
+        return 0
+
+    if aquecer:
+        try:
+            garantir_chrome(time.monotonic() + 60)
+            aquecer_perfil()
+        except Exception as erro:
+            print("[!] Nao deu para aquecer o perfil: %s" % mensagem_segura(erro), flush=True)
+
+    base = Path(saida).expanduser().resolve() if saida else SAIDA_PADRAO
+    base.mkdir(parents=True, exist_ok=True)
+    relatorio = base / "relatorio.csv"
+    novo = not relatorio.exists()
+    contagem, voltas = {}, {}
+    with open(relatorio, "a", newline="", encoding="utf-8") as arquivo:
+        escritor = csv.writer(arquivo, delimiter=";")
+        if novo:
+            escritor.writerow(["quando", "documento", "nome", "data", "status"])
+        posicao, total = 0, len(pendentes)
+        while pendentes:
+            registro = pendentes.popleft()
+            documento = registro["documento"]
+            posicao += 1
+            print("\n[%d/%d] %s %s" % (posicao, total, documento, registro["nome"]), flush=True)
+            codigo = executar(documento, registro["data"], saida, tempo_max)
+            if codigo and voltas.get(documento, 0) < repescagens:
+                voltas[documento] = voltas.get(documento, 0) + 1
+                pendentes.append(registro)
+                total += 1
+                status = "repescagem"
+                print("[i] Volta para o fim da fila (%d na frente)." % (len(pendentes) - 1), flush=True)
+            else:
+                status = "ok" if codigo == 0 else "falhou"
+            contagem[status] = contagem.get(status, 0) + 1
+            escritor.writerow([datetime.now(FUSO).strftime("%d/%m/%Y %H:%M:%S"), documento,
+                               registro["nome"], registro["data"] or "", status])
+            arquivo.flush()
+            if pendentes and intervalo > 0:
+                time.sleep(intervalo)
+
+    print("\n" + "=" * 50, flush=True)
+    for status in sorted(contagem):
+        print("%-14s %d" % (status, contagem[status]), flush=True)
+    print("relatorio: %s" % relatorio, flush=True)
+    return 0 if not contagem.get("falhou") else 1
+
+
 def ler_argumentos(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("documento", nargs="?", help="CPF ou CNPJ, com ou sem pontuação")
@@ -535,9 +692,37 @@ def ler_argumentos(argv=None):
     parser.add_argument("--data", "--data-nascimento", dest="data", help="Data opcional para CPF (DD/MM/AAAA)")
     parser.add_argument("--saida", type=Path, help="Pasta dos comprovantes")
     parser.add_argument("--tempo-max", type=int, default=180, help="Tempo máximo em segundos (padrão: 180)")
+    parser.add_argument("--entrada", type=Path,
+                        help="CSV com uma coluna cpf/cnpj (e data_nascimento, nome) para consultar em lote")
+    parser.add_argument("--repescagens", type=int, default=1,
+                        help="Quantas vezes um documento volta para o fim da fila (padrão: 1)")
+    parser.add_argument("--intervalo", type=float, default=10,
+                        help="Pausa em segundos entre as consultas do lote (padrão: 10)")
+    parser.add_argument("--sem-aquecer", dest="sem_aquecer", action="store_true",
+                        help="Começa o lote sem navegar antes em sites comuns")
+    parser.add_argument("--aquecer", nargs="?", const=3, type=int, metavar="SITES",
+                        help="Só aquece o perfil: navega em N sites comuns e encerra (padrão: 3)")
     args = parser.parse_args(argv)
     if args.tempo_max <= 0:
         parser.error("--tempo-max deve ser maior que zero")
+    if args.aquecer is not None:
+        if args.documento or args.entrada or args.cpf is not None or args.cnpj is not None:
+            parser.error("--aquecer só aquece o perfil; não informe documento nem --entrada.")
+        if args.aquecer < 1:
+            parser.error("--aquecer precisa de pelo menos um site")
+        return {"quantos": args.aquecer}
+    if args.entrada is not None:
+        if args.documento or args.cpf is not None or args.cnpj is not None or args.nascimento or args.data:
+            parser.error("--entrada consulta o CSV inteiro; não informe documento nem data.")
+        if args.repescagens < 0:
+            parser.error("--repescagens não pode ser negativo")
+        if args.intervalo < 0:
+            parser.error("--intervalo não pode ser negativo")
+        if not args.entrada.is_file():
+            parser.error("Arquivo de entrada não encontrado: %s" % args.entrada)
+        return {"entrada": args.entrada, "saida": args.saida, "tempo_max": args.tempo_max,
+                "repescagens": args.repescagens, "intervalo": args.intervalo,
+                "aquecer": not args.sem_aquecer}
     if args.documento is not None and (args.cnpj is not None or args.cpf is not None):
         parser.error("Informe o documento uma única vez, como argumento ou opção.")
     if args.nascimento and args.data:
@@ -556,11 +741,28 @@ def ler_argumentos(argv=None):
             raise ValueError("O documento informado não é um %s." % esperado.upper())
     except ValueError as erro:
         parser.error(str(erro))
-    return documento, data, args.saida, args.tempo_max
+    return {"documento": documento, "data": data, "saida": args.saida,
+            "tempo_max": args.tempo_max}
+
+
+def aquecer_somente(quantos=3, por_site=(40, 90)):
+    try:
+        garantir_chrome(time.monotonic() + 60)
+        aquecer_perfil(quantos, por_site)
+    except Exception as erro:
+        print("[-] Aquecimento falhou: %s" % mensagem_segura(erro), file=sys.stderr, flush=True)
+        return 1
+    print("[+] Perfil aquecido: %s" % PERFIL_CDP, flush=True)
+    return 0
 
 
 def main(argv=None):
-    return executar(*ler_argumentos(argv))
+    opcoes = ler_argumentos(argv)
+    if "quantos" in opcoes:
+        return aquecer_somente(**opcoes)
+    if "entrada" in opcoes:
+        return executar_lote(**opcoes)
+    return executar(**opcoes)
 
 
 if __name__ == "__main__":
