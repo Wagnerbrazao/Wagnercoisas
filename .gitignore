@@ -6,3 +6,7 @@ __pycache__/
 chrome_profile_enzo/
 *.png
 .claude/settings.local.json
+.venv-receita/
+.playwright-mcp/
+.playwright-cli/
+output/
