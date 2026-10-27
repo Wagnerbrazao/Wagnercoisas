@@ -18,7 +18,6 @@ import signal
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 import urllib.request
@@ -90,91 +89,129 @@ def tempo_restante(prazo, limite=30):
     return max(1, int(min(restante, limite) * 1000))
 
 
-def encerrar_consulta_projudi(processo):
-    """Encerra somente os processos criados para esta consulta, se ainda ativos."""
-    if processo.poll() is not None:
-        return
+PROJUDI_BASE = os.environ.get("PROJUDI_BASE_URL", "https://projudi.tjgo.jus.br").rstrip("/")
+PROJUDI_LOGIN_URL = os.environ.get("PROJUDI_LOGIN_URL") or PROJUDI_BASE + "/LogOn?PaginaAtual=-200"
+PROJUDI_PROCESSO_URL = os.environ.get("PROJUDI_PROCESSO_URL") or (
+    PROJUDI_BASE + "/ProcessoCivel?PaginaAtual=4&dependente=false&fisico=false")
+PROJUDI_CONTEXTO_URL = os.environ.get("PROJUDI_CONTEXTO_URL", "").strip()
+PROJUDI_ESPERA_2FA = float(os.environ.get("PROJUDI_ESPERA_2FA", "180"))
+
+# Passo 1 do cadastro de processo, so para chegar na lupa do polo ativo:
+# nada e salvo, o formulario e descartado no fim.
+PROJUDI_PASSO1 = ("#grauProcesso1", "#tipoProcessoCivel", "#isentoAssistencia", "#semDependencia")
+PROJUDI_LUPA = "#imaLocalizarPartePromovente"
+PROJUDI_CPF = "#CpfId"
+PROJUDI_BUSCAR = 'input[name="imgSubmeter"][value="Buscar"]'
+PROJUDI_NOME = "#Nome"
+PROJUDI_NASCIMENTO = "#DataNascimento"
+
+
+def quadro_com(page, seletor, prazo, limite=25):
+    """Devolve a pagina ou o iframe onde o seletor existe."""
+    fim = time.monotonic() + min(limite, max(1, (prazo - time.monotonic())))
+    while time.monotonic() < fim:
+        for quadro in [page] + list(page.frames):
+            try:
+                if quadro.locator(seletor).count():
+                    return quadro
+            except Exception:
+                continue
+        page.wait_for_timeout(300)
+    raise TimeoutError("O Projudi não mostrou %s a tempo." % seletor)
+
+
+def projudi_sem_sessao(page):
+    """O Projudi tem tres jeitos de dizer que ninguem esta logado."""
+    if "LogOn" in page.url:
+        return True
     try:
-        os.killpg(processo.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        processo.communicate(timeout=5)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(processo.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        processo.communicate()
+        if page.locator("#login").count():
+            return True
+        texto = page.inner_text("body", timeout=5000).lower()
+    except Exception:
+        return False
+    return "sessão expirada" in texto or "usuário inválido" in texto
+
+
+def projudi_entrar(page, prazo):
+    login = os.environ.get("PROJUDI_LOGIN", "").strip()
+    senha = os.environ.get("PROJUDI_SENHA", "")
+    if not login or not senha:
+        raise RuntimeError("Configure PROJUDI_LOGIN e PROJUDI_SENHA no .env.")
+    page.goto(PROJUDI_LOGIN_URL, wait_until="domcontentloaded", timeout=tempo_restante(prazo, 60))
+    if page.locator("#login").count():
+        page.fill("#login", login, timeout=tempo_restante(prazo, 15))
+        page.fill("#senha", senha, timeout=tempo_restante(prazo, 15))
+        # o botao Entrar e input type=button: Enter no formulario nao envia nada
+        page.locator('#entrar, input[name="entrar"], #blocoLogin input[value="Entrar"]').first.click(
+            timeout=tempo_restante(prazo, 15))
+        print("[+] Login do Projudi enviado; se ele pedir o código do segundo fator, "
+              "digite na janela (até %ds)." % PROJUDI_ESPERA_2FA, flush=True)
+        limite = time.monotonic() + PROJUDI_ESPERA_2FA
+        while time.monotonic() < limite and "LogOn" in page.url:
+            page.wait_for_timeout(1000)
+        if "LogOn" in page.url:
+            raise RuntimeError("O Projudi não saiu da tela de login (segundo fator pendente?).")
+    if PROJUDI_CONTEXTO_URL:
+        page.goto(PROJUDI_CONTEXTO_URL, wait_until="domcontentloaded",
+                  timeout=tempo_restante(prazo, 60))
 
 
 def consultar_nascimento_projudi(documento, prazo):
-    script = Path(os.environ.get("PROJUDI_NASCIMENTO_SCRIPT") or (
-        AQUI.parent / "consulta_nascimento_projudi.py"
-    )).expanduser().resolve()
-    projeto = Path(os.environ.get("PROJUDI_ROBO_DIR") or (
-        script.parent.parent / "CEAJE_PROTOCOLACAO_ROBO"
-    )).expanduser().resolve()
-    python = Path(os.environ.get("PROJUDI_PYTHON") or (
-        projeto / ".venv" / "bin" / "python"
-    )).expanduser().absolute()
-    if not script.is_file():
-        raise RuntimeError("Script de nascimento não encontrado. Configure PROJUDI_NASCIMENTO_SCRIPT.")
-    if not (projeto / "script.projudi.py").is_file():
-        raise RuntimeError("Robô do Projudi não encontrado. Configure PROJUDI_ROBO_DIR.")
-    if not python.is_file():
-        raise RuntimeError("Python do robô do Projudi não encontrado. Configure PROJUDI_PYTHON.")
+    """Le a data de nascimento que o Projudi tem para o CPF.
 
-    with tempfile.TemporaryDirectory(prefix="consulta-nascimento-") as temporario:
-        pasta = Path(temporario)
-        entrada, saida = pasta / "entrada.csv", pasta / "saida.csv"
-        with entrada.open("w", encoding="utf-8", newline="") as arquivo:
-            escritor = csv.writer(arquivo, delimiter=";")
-            escritor.writerow(["cpf"])
-            escritor.writerow([documento])
-        ambiente = os.environ.copy()
-        ambiente["PROJUDI_ROBO_DIR"] = str(projeto)
-        ambiente["PROJUDI_NAO_INTERATIVO"] = "1"
-        comando = [
-            str(python), "-B", str(script), str(entrada), str(saida),
-            "--coluna", "cpf", "--limite", "1", "--sem-manter-navegador",
-            "--user-data-dir", str(pasta / "perfil"), "--nao-confirmar-passo3",
-        ]
-        restante = tempo_restante(prazo, limite=float("inf")) / 1000
-        processo = subprocess.Popen(
-            comando, cwd=str(script.parent), env=ambiente, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding="utf-8", errors="replace", start_new_session=True,
-        )
+    Usa a mesma tela que o robo de protocolacao usa para localizar parte (a lupa
+    do polo ativo no Passo 1), mas so consulta: nunca clica em Inserir, nunca
+    cria nem altera nada.
+    """
+    garantir_chrome(prazo)
+    with sync_playwright() as p:
+        navegador = p.chromium.connect_over_cdp(CDP_URL, timeout=tempo_restante(prazo))
+        page = navegador.contexts[0].new_page()
         try:
-            registros, _ = processo.communicate(timeout=restante)
-        except subprocess.TimeoutExpired:
-            raise TimeoutError("Tempo máximo atingido durante a consulta de nascimento no Projudi.") from None
+            page.goto(PROJUDI_PROCESSO_URL, wait_until="domcontentloaded",
+                      timeout=tempo_restante(prazo, 60))
+            if projudi_sem_sessao(page):
+                projudi_entrar(page, prazo)
+                page.goto(PROJUDI_PROCESSO_URL, wait_until="domcontentloaded",
+                          timeout=tempo_restante(prazo, 60))
+                if projudi_sem_sessao(page):
+                    raise RuntimeError("O Projudi recusou a sessão depois do login.")
+            for seletor in PROJUDI_PASSO1:
+                alvo = page.locator(seletor).first
+                try:
+                    alvo.wait_for(state="visible", timeout=tempo_restante(prazo, 25))
+                except Exception:
+                    continue  # opcao que este formulario nao mostra
+                alvo.click(timeout=tempo_restante(prazo, 15))
+                # marcar uma opcao reenvia o formulario; esperar o redesenho
+                # evita clicar na proxima enquanto a tela ainda troca
+                try:
+                    page.wait_for_load_state("networkidle", timeout=tempo_restante(prazo, 15))
+                except Exception:
+                    pass
+            page.locator(PROJUDI_LUPA).first.click(timeout=tempo_restante(prazo, 25))
+            quadro = quadro_com(page, PROJUDI_CPF, prazo)
+            quadro.fill(PROJUDI_CPF, documento, timeout=tempo_restante(prazo, 15))
+            quadro.locator(PROJUDI_BUSCAR).first.click(timeout=tempo_restante(prazo, 15))
+            quadro = quadro_com(page, PROJUDI_NASCIMENTO, prazo)
+            nome = (quadro.locator(PROJUDI_NOME).first.input_value(
+                timeout=tempo_restante(prazo, 10)) or "").strip()
+            data = (quadro.locator(PROJUDI_NASCIMENTO).first.input_value(
+                timeout=tempo_restante(prazo, 10)) or "").strip()
         finally:
-            encerrar_consulta_projudi(processo)
-        if processo.returncode != 0:
-            if "segundo fator" in registros.lower() or "tela de login" in registros.lower():
-                raise RuntimeError("O Projudi não concluiu a autenticação. Verifique o login e o segundo fator do robô.")
-            raise RuntimeError("O script de nascimento do Projudi terminou com erro (%d)." % processo.returncode)
-        if not saida.is_file():
-            raise RuntimeError("A consulta de nascimento do Projudi não gerou resultado.")
-        with saida.open(encoding="utf-8-sig", newline="") as arquivo:
-            linhas = list(csv.DictReader(arquivo, delimiter=";"))
-        if len(linhas) != 1 or normalizar_documento(linhas[0].get("cpf")) != documento:
-            raise RuntimeError("O resultado do Projudi não corresponde ao CPF solicitado.")
-        linha = linhas[0]
-        situacao = (linha.get("situacao") or "").strip().lower()
-        if situacao == "nao cadastrado":
-            raise RuntimeError("CPF não cadastrado no Projudi; data de nascimento indisponível.")
-        if situacao != "encontrado":
-            raise RuntimeError("O Projudi não conseguiu consultar o cadastro deste CPF.")
-        data = (linha.get("data_nascimento") or "").strip()
-        if not data:
-            raise RuntimeError("O cadastro do Projudi não contém data de nascimento para este CPF.")
-        try:
-            return identificar_consulta(documento, data)[2]
-        except ValueError:
-            raise RuntimeError("A data de nascimento retornada pelo Projudi é inválida.") from None
+            try:
+                page.close()
+            except Exception:
+                pass
+    if not nome:
+        raise RuntimeError("CPF não cadastrado no Projudi; data de nascimento indisponível.")
+    if not data:
+        raise RuntimeError("O cadastro do Projudi não contém data de nascimento para este CPF.")
+    try:
+        return identificar_consulta(documento, data)[2]
+    except ValueError:
+        raise RuntimeError("A data de nascimento retornada pelo Projudi é inválida.") from None
 
 
 def cdp_ativo():
@@ -524,12 +561,12 @@ def executar(documento, data=None, saida=None, tempo_max=180):
         prazo = time.monotonic() + tempo_max
         modelo = modelo_gemini()
         fonte_nascimento = "informada" if data else None
+        garantir_chrome(prazo)
         if tipo == "cpf" and not data:
             print("[+] Buscando data de nascimento no Projudi...", flush=True)
             data = consultar_nascimento_projudi(documento, prazo)
             fonte_nascimento = "projudi"
             print("[+] Data de nascimento obtida e validada.", flush=True)
-        garantir_chrome(prazo)
         base = Path(saida).expanduser().resolve() if saida else SAIDA_PADRAO / tipo
         pasta = base / (documento + "_" + datetime.now(FUSO).strftime("%Y%m%d_%H%M%S_%f"))
         pasta.mkdir(parents=True, exist_ok=True)
