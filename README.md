@@ -1,6 +1,6 @@
 # Consultas de CPF e CNPJ
 
-Todo o fluxo está em `rodar_tudo.py`. O número recebido determina qual site da
+O fluxo da Receita está em `rodar_tudo.py`. O número recebido determina qual site da
 Receita Federal será consultado.
 
 ```bash
@@ -68,3 +68,40 @@ O JSON de CPF registra a data utilizada e sua origem (`projudi` ou `informada`).
 
 O Chrome pessoal e as outras abas permanecem abertos. `ROBO_JANELA=visivel`
 exibe a janela da automação quando há uma sessão gráfica disponível.
+
+## GPREV — sugestão de GPREV ou INSS por CPF
+
+Configure `LOGIN_GPREV` e `PASSWORD_GPREV` no `.env` ou no ambiente. A leitura
+do captcha acontece localmente com Tesseract e Pillow, sem serviços externos.
+O Tesseract deve estar instalado (`sudo apt install tesseract-ocr`).
+
+```bash
+venv/bin/python gprev.py 70508973104
+# Execução sem janela:
+venv/bin/python gprev.py 70508973104 --headless
+```
+
+O script entra no GPREV, lê o captcha automaticamente, segue **Arrecadação →
+Cadastros → Guias → Precatório**, digita o CPF com a máscara do site e clica no
+link **CPF** (`selDadosPessoaisCpf`). Aguarda a janela da consulta e confere que
+o CPF retornado corresponde ao solicitado. Apenas consulta: não inclui registros
+nem emite DARE. Usa uma sessão própria e preserva os outros navegadores.
+
+Cada execução salva `resultado.json`, `consulta.png` e `formulario.png` em
+`output/playwright/gprev/`. A sugestão para a IA segue esta regra:
+
+- Se houver nome, nascimento ou vínculos no resultado: `sugestao: "GPREV"` e
+  `sub_tipo_sugerido: 11`.
+- Se a consulta válida retornar vazia: `sugestao: "INSS"` e
+  `sub_tipo_sugerido: 12`.
+- Se houver falha no login, na consulta ou na validação do resultado:
+  `status: "ERRO"`, `sugestao: null` e `sub_tipo_sugerido: null`.
+
+O JSON também inclui o CPF, nome, nascimento, vínculos e a justificativa da
+sugestão no campo `mensagem`. É uma sugestão para a IA: não altera a guia no
+orquestrador. Ambas as sugestões válidas usam `status: "SUCESSO"`.
+
+O código de saída é 0 para uma sugestão válida (GPREV ou INSS), 1 para falha
+e 2 para configuração ou argumentos inválidos.
+Use `--saida`, `--tempo-max` e `--tentativas-captcha` para ajustar a execução.
+Credenciais nunca são gravadas nos resultados.
